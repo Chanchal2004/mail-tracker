@@ -21,6 +21,9 @@ APP_PASSWORD = "dcompgffjspiflkv"
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
 
+
+
+
 # IMPORTANT:
 # Normal Gmail password mat daalna.
 # Google ka 16-character APP PASSWORD daalna.
@@ -29,7 +32,8 @@ SMTP_PORT = 465
 # OPEN TRACKING
 # ============================================================
 # Local testing:
-BASE_URL = "http://127.0.0.1:5000"
+
+BASE_URL = "https://clasp-staring-steadier.ngrok-free.dev/open "
 
 # Real mail open tracking ke liye BASE_URL ko public HTTPS URL
 # banana padega (for example your ngrok/cloudflare tunnel URL).
