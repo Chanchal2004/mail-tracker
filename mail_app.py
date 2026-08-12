@@ -33,7 +33,7 @@ SMTP_PORT = 465
 # ============================================================
 # Local testing:
 
-BASE_URL = "https://clasp-staring-steadier.ngrok-free.dev/open "
+BASE_URL = "https://clasp-staring-steadier.ngrok-free.dev"
 
 # Real mail open tracking ke liye BASE_URL ko public HTTPS URL
 # banana padega (for example your ngrok/cloudflare tunnel URL).
@@ -224,10 +224,9 @@ def send():
             {safe_message}
 
             <img
-                src="{html.escape(tracking_url, quote=True)}"
+                src="https://clasp-staring-steadier.ngrok-free.dev/open/TRACKING_ID"
                 width="1"
                 height="1"
-                style="width:1px;height:1px;border:0;"
                 alt=""
             >
         </body>
