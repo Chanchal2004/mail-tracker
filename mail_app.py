@@ -20,6 +20,7 @@ SENDER_EMAIL = "chanchal053btcse22@igdtuw.ac.in"
 APP_PASSWORD = "dcompgffjspiflkv"
 # Gmail:
 SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 465
 
 
 
