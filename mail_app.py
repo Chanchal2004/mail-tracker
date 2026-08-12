@@ -33,7 +33,7 @@ SMTP_PORT = 465
 # ============================================================
 # Local testing:
 
-BASE_URL = "https://clasp-staring-steadier.ngrok-free.dev"
+BASE_URL = "https://maill-trackkk.onrender.com/"
 
 # Real mail open tracking ke liye BASE_URL ko public HTTPS URL
 # banana padega (for example your ngrok/cloudflare tunnel URL).
