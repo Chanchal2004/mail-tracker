@@ -25,7 +25,7 @@ SENDER_EMAIL = "chanchal053btcse22@igdtuw.ac.in"
 APP_PASSWORD = "dcompgffjspiflkv"
 
 # YOUR RENDER URL - NO /track AT THE END:
-RENDER_URL = "https://maill-trackkk.onrender.com"
+RENDER_URL = "https://mail-trackingggg.onrender.com"
 
 # Put the SAME secret on Render and your PC.
 TRACKER_SECRET = "MailTracker_2026_XYZ"
