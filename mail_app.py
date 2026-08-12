@@ -35,7 +35,7 @@ SMTP_PORT = 465
 # ============================================================
 # Local testing:
 
-BASE_URL = "https://maill-trackkk.onrender.com/"
+BASE_URL = "https://mail-trackingggg.onrender.com"
 
 # Real mail open tracking ke liye BASE_URL ko public HTTPS URL
 # banana padega (for example your ngrok/cloudflare tunnel URL).
