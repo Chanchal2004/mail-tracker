@@ -5,6 +5,7 @@ import ssl
 import uuid
 import re
 import html
+import os
 from datetime import datetime
 from email.message import EmailMessage
 
