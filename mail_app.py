@@ -224,7 +224,7 @@ def send():
             {safe_message}
 
             <img
-                src="https://clasp-staring-steadier.ngrok-free.dev/open/TRACKING_ID"
+                src="{html.escape(tracking_url,quote=True)}"
                 width="1"
                 height="1"
                 alt=""
