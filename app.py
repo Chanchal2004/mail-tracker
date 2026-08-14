@@ -3,7 +3,10 @@ import re
 import sqlite3
 import secrets
 import base64
-from datetime import datetime, timezone
+import json
+
+
+from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 from html import escape
 
@@ -16,18 +19,17 @@ from flask import (
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 
 # ============================================================
-# APP CONFIG
+# CONFIG
 # ============================================================
 
 APP = Flask(__name__)
 
-HOST = "127.0.0.1"
-PORT = 5000
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", 5000))
 
 DB_FILE = "tracker.db"
 
@@ -42,27 +44,62 @@ SCOPES = [
 
 
 # ============================================================
-# CLOUDFLARE PUBLIC URL
-# ============================================================
-#
-# Current Quick Tunnel:
-#
-# https://performer-wooden-pipes-mrna.trycloudflare.com
-#
-# IMPORTANT:
-# If cloudflared gives you a NEW URL after restart,
-# change this value.
-#
-# You can also set:
-#
-# set PUBLIC_URL=https://your-url.trycloudflare.com
-#
+# PUBLIC CLOUDFLARE URL
 # ============================================================
 
 PUBLIC_URL = os.environ.get(
     "PUBLIC_URL",
-    "https://performer-wooden-pipes-mrna.trycloudflare.com"
+    "https://email-tracker-7tr6.onrender.com"
 ).rstrip("/")
+
+
+# ============================================================
+# TIME
+# ============================================================
+
+def utc_now():
+
+    return datetime.now(
+        timezone.utc
+    ).isoformat(
+        timespec="seconds"
+    )
+
+
+def display_time(value):
+
+    if not value:
+        return "-"
+
+    try:
+
+        dt = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
+
+        ist = dt.astimezone(
+            timezone(
+                timedelta(
+                    hours=5,
+                    minutes=30
+                )
+            )
+        )
+
+        return dt_to_display(
+            ist
+        )
+
+    except Exception:
+
+        return value
+
+
+def dt_to_display(dt):
+
+    return dt.strftime(
+        "%d %b %Y, %I:%M:%S %p"
+    )
 
 
 # ============================================================
@@ -89,15 +126,6 @@ def get_db():
     return conn
 
 
-def utc_now():
-
-    return datetime.now(
-        timezone.utc
-    ).isoformat(
-        timespec="seconds"
-    )
-
-
 def init_db():
 
     conn = get_db()
@@ -106,6 +134,11 @@ def init_db():
 
     # --------------------------------------------------------
     # EMAILS
+    #
+    # first_opened_at and last_opened_at are intentionally
+    # kept for compatibility with an existing tracker.db.
+    #
+    # They are NOT displayed or used by the dashboard.
     # --------------------------------------------------------
 
     cur.execute("""
@@ -164,17 +197,43 @@ def init_db():
 
             referer TEXT,
 
-            name TEXT,
+            FOREIGN KEY(tracking_id)
+                REFERENCES emails(tracking_id)
+                ON DELETE CASCADE
+        )
+    """)
 
-            email TEXT,
+    # --------------------------------------------------------
+    # FORM SUBMISSIONS
+    #
+    # Only information explicitly entered and submitted
+    # through the disclosed form is stored.
+    # --------------------------------------------------------
 
-            FOREIGN KEY (
-                tracking_id
-            )
-            REFERENCES emails(
-                tracking_id
-            )
-            ON DELETE CASCADE
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS form_submissions (
+
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            tracking_id TEXT NOT NULL,
+
+            name TEXT NOT NULL,
+
+            phone TEXT NOT NULL,
+
+            email TEXT NOT NULL,
+
+            submitted_at TEXT NOT NULL,
+
+            ip TEXT,
+
+            user_agent TEXT,
+
+            referer TEXT,
+
+            FOREIGN KEY(tracking_id)
+                REFERENCES emails(tracking_id)
+                ON DELETE CASCADE
         )
     """)
 
@@ -184,17 +243,30 @@ def init_db():
 
     cur.execute("""
         CREATE INDEX IF NOT EXISTS
-        idx_activity_tracking_id
+        idx_activity_tracking
         ON activity(tracking_id)
     """)
 
     cur.execute("""
         CREATE INDEX IF NOT EXISTS
-        idx_activity_timestamp
+        idx_activity_time
         ON activity(timestamp)
     """)
 
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS
+        idx_form_tracking
+        ON form_submissions(tracking_id)
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS
+        idx_form_time
+        ON form_submissions(submitted_at)
+    """)
+
     conn.commit()
+
     conn.close()
 
     print(
@@ -204,43 +276,100 @@ def init_db():
 
 
 # ============================================================
-# GOOGLE GMAIL AUTH
+# GMAIL AUTH
 # ============================================================
 
 def gmail_service():
 
     creds = None
 
-    # --------------------------------------------------------
-    # Existing token
-    # --------------------------------------------------------
+    # ========================================================
+    # 1. LOAD AUTHORIZED TOKEN FROM RENDER ENVIRONMENT
+    # ========================================================
+    #
+    # Render Environment Variable:
+    #
+    # GMAIL_TOKEN_JSON
+    #
+    # Value = COMPLETE contents of token.json
+    #
+    # Example:
+    # {
+    #   "token": "...",
+    #   "refresh_token": "...",
+    #   "token_uri": "https://oauth2.googleapis.com/token",
+    #   "client_id": "...",
+    #   "client_secret": "...",
+    #   "scopes": [
+    #       "https://www.googleapis.com/auth/gmail.send"
+    #   ]
+    # }
+    #
+    # IMPORTANT:
+    # We do NOT call run_local_server() on Render.
+    # That would require a browser and causes the deployment problem.
+    # ========================================================
 
-    if os.path.exists(
-        TOKEN_FILE
-    ):
+    token_json = os.environ.get("GMAIL_TOKEN_JSON")
+
+    if token_json:
 
         try:
 
-            creds = (
-                Credentials
-                .from_authorized_user_file(
-                    TOKEN_FILE,
-                    SCOPES
-                )
+            token_data = json.loads(token_json)
+
+            creds = Credentials.from_authorized_user_info(
+                token_data,
+                SCOPES
+            )
+
+            print(
+                "Gmail token loaded from GMAIL_TOKEN_JSON."
             )
 
         except Exception as e:
 
             print(
-                "Existing token could not be loaded:",
+                "Could not load GMAIL_TOKEN_JSON:",
                 e
             )
 
             creds = None
 
-    # --------------------------------------------------------
-    # Refresh token
-    # --------------------------------------------------------
+    # ========================================================
+    # 2. LOCAL DEVELOPMENT FALLBACK
+    # ========================================================
+    #
+    # This lets the same code work locally if token.json exists.
+    #
+    # Render does not need this when GMAIL_TOKEN_JSON is configured.
+    # ========================================================
+
+    if creds is None and os.path.exists(TOKEN_FILE):
+
+        try:
+
+            creds = Credentials.from_authorized_user_file(
+                TOKEN_FILE,
+                SCOPES
+            )
+
+            print(
+                "Gmail token loaded from token.json."
+            )
+
+        except Exception as e:
+
+            print(
+                "Could not load token.json:",
+                e
+            )
+
+            creds = None
+
+    # ========================================================
+    # 3. REFRESH EXPIRED TOKEN
+    # ========================================================
 
     if (
         creds
@@ -254,6 +383,10 @@ def gmail_service():
                 Request()
             )
 
+            print(
+                "Gmail token refreshed successfully."
+            )
+
         except Exception as e:
 
             print(
@@ -263,61 +396,40 @@ def gmail_service():
 
             creds = None
 
-    # --------------------------------------------------------
-    # New OAuth login
-    # --------------------------------------------------------
+    # ========================================================
+    # 4. NEVER START INTERACTIVE OAUTH ON RENDER
+    # ========================================================
+    #
+    # If this happens, either:
+    #
+    # - GMAIL_TOKEN_JSON is missing
+    # - token.json is invalid
+    # - token.json does not contain a refresh token
+    # - the Google OAuth token has been revoked
+    #
+    # Generate/authorize token.json locally, then put its COMPLETE
+    # contents into the Render variable GMAIL_TOKEN_JSON.
+    # ========================================================
 
     if not creds or not creds.valid:
 
-        if not os.path.exists(
-            CREDENTIALS_FILE
-        ):
-
-            raise FileNotFoundError(
-                "credentials.json nahi mila. "
-                "Isko app.py ke same folder mein rakho."
-            )
-
-        print()
-        print(
-            "Opening Google OAuth..."
+        raise RuntimeError(
+            "Gmail authentication failed. "
+            "Set GMAIL_TOKEN_JSON in Render to the complete "
+            "contents of your authorized token.json file. "
+            "Do not use run_local_server() on Render."
         )
 
-        flow = (
-            InstalledAppFlow
-            .from_client_secrets_file(
-                CREDENTIALS_FILE,
-                SCOPES
-            )
-        )
-
-        creds = flow.run_local_server(
-            port=0
-        )
-
-        # ----------------------------------------------------
-        # token.json AUTOMATICALLY CREATED
-        # ----------------------------------------------------
-
-        with open(
-            TOKEN_FILE,
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            f.write(
-                creds.to_json()
-            )
-
-        print(
-            "token.json created."
-        )
+    # ========================================================
+    # 5. BUILD GMAIL API SERVICE
+    # ========================================================
 
     return build(
         "gmail",
         "v1",
         credentials=creds
     )
+
 
 
 # ============================================================
@@ -339,20 +451,45 @@ def valid_email(value):
 
 
 # ============================================================
+# PHONE VALIDATION
+# ============================================================
+
+PHONE_REGEX = re.compile(
+    r"^[0-9+\-\s()]{7,20}$"
+)
+
+
+def valid_phone(value):
+
+    value = str(value).strip()
+
+    if not PHONE_REGEX.match(value):
+
+        return False
+
+    digits = re.sub(
+        r"\D",
+        "",
+        value
+    )
+
+    return 7 <= len(digits) <= 15
+
+
+# ============================================================
 # REQUEST INFORMATION
 # ============================================================
 
 def request_ip():
 
-    # Cloudflare
     cf_ip = request.headers.get(
         "CF-Connecting-IP"
     )
 
     if cf_ip:
+
         return cf_ip
 
-    # Proxy
     forwarded = request.headers.get(
         "X-Forwarded-For"
     )
@@ -365,10 +502,7 @@ def request_ip():
             .strip()
         )
 
-    return (
-        request.remote_addr
-        or ""
-    )
+    return request.remote_addr or ""
 
 
 def request_user_agent():
@@ -388,12 +522,10 @@ def request_referer():
 
 
 # ============================================================
-# CHECK TRACKING ID
+# TRACKING ID
 # ============================================================
 
-def tracking_exists(
-    tracking_id
-):
+def tracking_exists(tracking_id):
 
     conn = get_db()
 
@@ -416,18 +548,12 @@ def tracking_exists(
 
 def log_activity(
     tracking_id,
-    event,
-    name=None,
-    email=None
+    event
 ):
 
     now = utc_now()
 
     conn = get_db()
-
-    # --------------------------------------------------------
-    # Verify tracking ID
-    # --------------------------------------------------------
 
     row = conn.execute("""
         SELECT tracking_id
@@ -444,7 +570,7 @@ def log_activity(
         return False
 
     # --------------------------------------------------------
-    # Store event
+    # Save activity event
     # --------------------------------------------------------
 
     conn.execute("""
@@ -455,28 +581,25 @@ def log_activity(
             timestamp,
             ip,
             user_agent,
-            referer,
-            name,
-            email
+            referer
 
         )
-
-        VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?
-        )
+        VALUES (?, ?, ?, ?, ?, ?)
     """, (
         tracking_id,
         event,
         now,
         request_ip(),
         request_user_agent(),
-        request_referer(),
-        name,
-        email
+        request_referer()
     ))
 
     # --------------------------------------------------------
     # OPEN
+    #
+    # Only count is maintained.
+    #
+    # First Open / Last Open are intentionally NOT updated.
     # --------------------------------------------------------
 
     if event == "open":
@@ -486,25 +609,12 @@ def log_activity(
 
             SET
 
-                first_opened_at =
-                    COALESCE(
-                        first_opened_at,
-                        ?
-                    ),
-
-                last_opened_at = ?,
-
                 open_count =
-                    COALESCE(
-                        open_count,
-                        0
-                    ) + 1
+                    open_count + 1
 
             WHERE tracking_id = ?
         """, (
-            now,
-            now,
-            tracking_id
+            tracking_id,
         ))
 
     # --------------------------------------------------------
@@ -527,10 +637,7 @@ def log_activity(
                 last_clicked_at = ?,
 
                 click_count =
-                    COALESCE(
-                        click_count,
-                        0
-                    ) + 1
+                    click_count + 1
 
             WHERE tracking_id = ?
         """, (
@@ -559,10 +666,7 @@ def log_activity(
                 last_page_visit_at = ?,
 
                 page_visit_count =
-                    COALESCE(
-                        page_visit_count,
-                        0
-                    ) + 1
+                    page_visit_count + 1
 
             WHERE tracking_id = ?
         """, (
@@ -583,8 +687,6 @@ def log_activity(
 # ============================================================
 
 def create_email_html(
-    recipient,
-    subject,
     tracking_id,
     message
 ):
@@ -614,7 +716,7 @@ def create_email_html(
         pixel_url
     )
 
-    html = f"""
+    return f"""
 <!doctype html>
 
 <html>
@@ -627,7 +729,11 @@ def create_email_html(
 
 <body>
 
-<div>
+<div style="
+    white-space:pre-wrap;
+    font-family:Arial,sans-serif;
+    line-height:1.5;
+">
 
 {safe_message}
 
@@ -635,32 +741,28 @@ def create_email_html(
 
 <br>
 
-<div>
+<p>
 
 <a
     href="{safe_tracking_url}"
     target="_blank"
     rel="noopener noreferrer"
 >
-    Continue
+
+Open link
+
 </a>
 
-</div>
-
-<br>
-
-<p
-    style="
-        font-size:12px;
-        color:#777;
-    "
->
-    This link is provided for the recipient's
-    voluntary use.
 </p>
 
+<p style="
+    font-size:12px;
+    color:#777;
+">
 
-<!-- EMAIL TRACKING PIXEL -->
+This email contains a tracking link.
+
+</p>
 
 <img
     src="{safe_pixel_url}"
@@ -675,8 +777,6 @@ def create_email_html(
 </html>
 """
 
-    return html
-
 
 # ============================================================
 # SEND ONE EMAIL
@@ -689,10 +789,6 @@ def send_one_email(
     message
 ):
 
-    # --------------------------------------------------------
-    # UNIQUE TRACKING ID
-    # --------------------------------------------------------
-
     tracking_id = secrets.token_urlsafe(
         32
     )
@@ -700,15 +796,9 @@ def send_one_email(
     sent_at = utc_now()
 
     html = create_email_html(
-        recipient,
-        subject,
         tracking_id,
         message
     )
-
-    # --------------------------------------------------------
-    # EMAIL MESSAGE
-    # --------------------------------------------------------
 
     msg = EmailMessage()
 
@@ -718,24 +808,19 @@ def send_one_email(
 
     msg["Subject"] = subject
 
-    # Plain-text version
     msg.set_content(
         message
     )
 
-    # HTML version
     msg.add_alternative(
         html,
         subtype="html"
     )
 
-    # --------------------------------------------------------
-    # Gmail raw message
-    # --------------------------------------------------------
-
     raw = base64.urlsafe_b64encode(
         msg.as_bytes()
     ).decode()
+
     result = (
         service
         .users()
@@ -749,13 +834,9 @@ def send_one_email(
         .execute()
     )
 
-    gmail_message_id = (
-        result.get("id")
+    gmail_message_id = result.get(
+        "id"
     )
-
-    # --------------------------------------------------------
-    # SAVE BEFORE RETURN
-    # --------------------------------------------------------
 
     conn = get_db()
 
@@ -769,10 +850,7 @@ def send_one_email(
             gmail_message_id
 
         )
-
-        VALUES (
-            ?, ?, ?, ?, ?
-        )
+        VALUES (?, ?, ?, ?, ?)
     """, (
         tracking_id,
         recipient,
@@ -786,18 +864,10 @@ def send_one_email(
     conn.close()
 
     return {
-
         "success": True,
-
-        "tracking_id":
-            tracking_id,
-
-        "recipient":
-            recipient,
-
-        "message_id":
-            gmail_message_id,
-
+        "tracking_id": tracking_id,
+        "recipient": recipient,
+        "message_id": gmail_message_id,
         "tracking_url":
             PUBLIC_URL
             + "/go/"
@@ -826,41 +896,32 @@ def dashboard():
         DASHBOARD_HTML,
         emails=emails,
         public_url=PUBLIC_URL,
-        sender=SENDER_EMAIL
+        sender=SENDER_EMAIL,
+        format_time=display_time
     )
 
 
 # ============================================================
-# SEND FORM
+# SEND EMAIL
 # ============================================================
 
 @APP.post("/send")
 def send_from_dashboard():
 
-    recipients_text = (
-        request.form.get(
-            "recipients",
-            ""
-        )
+    recipients_text = request.form.get(
+        "recipients",
+        ""
     )
 
-    subject = (
-        request.form.get(
-            "subject",
-            ""
-        ).strip()
-    )
+    subject = request.form.get(
+        "subject",
+        ""
+    ).strip()
 
-    message = (
-        request.form.get(
-            "message",
-            ""
-        ).strip()
-    )
-
-    # --------------------------------------------------------
-    # Parse recipients
-    # --------------------------------------------------------
+    message = request.form.get(
+        "message",
+        ""
+    ).strip()
 
     raw_recipients = re.split(
         r"[\n,;]+",
@@ -876,6 +937,7 @@ def send_from_dashboard():
         email = item.strip()
 
         if not email:
+
             continue
 
         if valid_email(email):
@@ -895,16 +957,15 @@ def send_from_dashboard():
                 email
             )
 
-    # --------------------------------------------------------
-    # Validate
-    # --------------------------------------------------------
-
     if not recipients:
 
         return render_template_string(
             MESSAGE_HTML,
             title="Error",
-            message="At least one valid recipient email required.",
+            message=(
+                "At least one valid recipient "
+                "email required."
+            ),
             back=True
         ), 400
 
@@ -926,10 +987,6 @@ def send_from_dashboard():
             back=True
         ), 400
 
-    # --------------------------------------------------------
-    # Gmail
-    # --------------------------------------------------------
-
     try:
 
         service = gmail_service()
@@ -944,10 +1001,6 @@ def send_from_dashboard():
         ), 500
 
     results = []
-
-    # --------------------------------------------------------
-    # Send each recipient separately
-    # --------------------------------------------------------
 
     for recipient in recipients:
 
@@ -967,20 +1020,10 @@ def send_from_dashboard():
         except Exception as e:
 
             results.append({
-
-                "success":
-                    False,
-
-                "recipient":
-                    recipient,
-
-                "error":
-                    str(e)
+                "success": False,
+                "recipient": recipient,
+                "error": str(e)
             })
-
-    # --------------------------------------------------------
-    # Result page
-    # --------------------------------------------------------
 
     return render_template_string(
         SEND_RESULT_HTML,
@@ -990,7 +1033,7 @@ def send_from_dashboard():
 
 
 # ============================================================
-# TRACKING PIXEL
+# 1x1 GIF
 # ============================================================
 
 GIF_1X1 = (
@@ -1008,14 +1051,14 @@ GIF_1X1 = (
 )
 
 
+# ============================================================
+# EMAIL OPEN TRACKING
+# ============================================================
+
 @APP.get(
     "/track/<tracking_id>.gif"
 )
 def track_open(tracking_id):
-
-    # --------------------------------------------------------
-    # Only record valid IDs
-    # --------------------------------------------------------
 
     if tracking_exists(
         tracking_id
@@ -1053,7 +1096,7 @@ def track_open(tracking_id):
 
 
 # ============================================================
-# TRACKED EMAIL LINK
+# TRACKING LINK
 # ============================================================
 
 @APP.get(
@@ -1068,22 +1111,21 @@ def tracked_link(tracking_id):
         return render_template_string(
             MESSAGE_HTML,
             title="Invalid Link",
-            message="This tracking link is invalid or expired.",
+            message=(
+                "This tracking link is "
+                "invalid or expired."
+            ),
             back=False
         ), 404
 
     # --------------------------------------------------------
-    # CLICK
+    # Every request to /go/<tracking_id> = CLICK
     # --------------------------------------------------------
 
     log_activity(
         tracking_id,
         "click"
     )
-
-    # --------------------------------------------------------
-    # Landing page
-    # --------------------------------------------------------
 
     return render_template_string(
         LANDING_HTML,
@@ -1092,13 +1134,13 @@ def tracked_link(tracking_id):
 
 
 # ============================================================
-# PAGE ACTIVITY
+# PAGE VISIT
 # ============================================================
 
 @APP.post(
-    "/api/activity/<tracking_id>"
+    "/api/page-visit/<tracking_id>"
 )
-def activity_api(tracking_id):
+def page_visit(tracking_id):
 
     if not tracking_exists(
         tracking_id
@@ -1109,98 +1151,353 @@ def activity_api(tracking_id):
             "error": "Invalid tracking ID"
         }), 404
 
-    data = (
-        request.get_json(
-            silent=True
-        )
-        or {}
+    log_activity(
+        tracking_id,
+        "page_visit"
     )
-
-    event = data.get(
-        "event"
-    )
-
-    # --------------------------------------------------------
-    # PAGE VISIT
-    # --------------------------------------------------------
-
-    if event == "page_visit":
-
-        log_activity(
-            tracking_id,
-            "page_visit"
-        )
-
-        return jsonify({
-            "success": True
-        })
-
-    # --------------------------------------------------------
-    # VOLUNTARY FORM SUBMISSION
-    # --------------------------------------------------------
-
-    if event == "form_submit":
-
-        name = str(
-            data.get(
-                "name",
-                ""
-            )
-        ).strip()
-
-        email = str(
-            data.get(
-                "email",
-                ""
-            )
-        ).strip()
-
-        if not name:
-
-            return jsonify({
-                "success": False,
-                "error": "Name required"
-            }), 400
-
-        if not valid_email(
-            email
-        ):
-
-            return jsonify({
-                "success": False,
-                "error":
-                    "Valid email required"
-            }), 400
-
-        # Reasonable storage limits
-        name = name[:200]
-        email = email[:320]
-
-        log_activity(
-            tracking_id,
-            "form_submit",
-            name=name,
-            email=email
-        )
-
-        return jsonify({
-            "success": True
-        })
 
     return jsonify({
-        "success": False,
-        "error": "Invalid event"
-    }), 400
+        "success": True
+    })
 
 
 # ============================================================
-# ACTIVITY JSON
+# FORM SUBMISSION
+#
+# Only explicitly submitted form values are stored.
+# ============================================================
+
+@APP.post(
+    "/api/form-submit/<tracking_id>"
+)
+def form_submit(tracking_id):
+
+    if not tracking_exists(
+        tracking_id
+    ):
+
+        return jsonify({
+            "success": False,
+            "error": "Invalid tracking ID"
+        }), 404
+
+    # --------------------------------------------------------
+    # Read form values
+    # --------------------------------------------------------
+
+    name = request.form.get(
+        "name",
+        ""
+    ).strip()
+
+    phone = request.form.get(
+        "phone",
+        ""
+    ).strip()
+
+    email = request.form.get(
+        "email",
+        ""
+    ).strip()
+
+    consent = request.form.get(
+        "consent",
+        ""
+    ).strip()
+
+    # --------------------------------------------------------
+    # Consent
+    # --------------------------------------------------------
+
+    if consent != "yes":
+
+        return render_template_string(
+            FORM_ERROR_HTML,
+            tracking_id=tracking_id,
+            message=(
+                "Please confirm the consent checkbox "
+                "before submitting."
+            )
+        ), 400
+
+    # --------------------------------------------------------
+    # Name validation
+    # --------------------------------------------------------
+
+    if not name:
+
+        return render_template_string(
+            FORM_ERROR_HTML,
+            tracking_id=tracking_id,
+            message="Name is required."
+        ), 400
+
+    if len(name) > 100:
+
+        return render_template_string(
+            FORM_ERROR_HTML,
+            tracking_id=tracking_id,
+            message="Name is too long."
+        ), 400
+
+    # --------------------------------------------------------
+    # Phone validation
+    # --------------------------------------------------------
+
+    if not valid_phone(phone):
+
+        return render_template_string(
+            FORM_ERROR_HTML,
+            tracking_id=tracking_id,
+            message=(
+                "Please enter a valid contact number."
+            )
+        ), 400
+
+    # --------------------------------------------------------
+    # Email validation
+    # --------------------------------------------------------
+
+    if not valid_email(email):
+
+        return render_template_string(
+            FORM_ERROR_HTML,
+            tracking_id=tracking_id,
+            message=(
+                "Please enter a valid email address."
+            )
+        ), 400
+
+    # --------------------------------------------------------
+    # Save submission
+    # --------------------------------------------------------
+
+    now = utc_now()
+
+    conn = get_db()
+
+    conn.execute("""
+        INSERT INTO form_submissions (
+
+            tracking_id,
+            name,
+            phone,
+            email,
+            submitted_at,
+            ip,
+            user_agent,
+            referer
+
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        tracking_id,
+        name,
+        phone,
+        email,
+        now,
+        request_ip(),
+        request_user_agent(),
+        request_referer()
+    ))
+
+    # --------------------------------------------------------
+    # Also save FORM SUBMIT activity event
+    # --------------------------------------------------------
+
+    conn.execute("""
+        INSERT INTO activity (
+
+            tracking_id,
+            event,
+            timestamp,
+            ip,
+            user_agent,
+            referer
+
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        tracking_id,
+        "form_submit",
+        now,
+        request_ip(),
+        request_user_agent(),
+        request_referer()
+    ))
+
+    conn.commit()
+
+    conn.close()
+
+    return render_template_string(
+        FORM_SUCCESS_HTML,
+        name=escape(name)
+    )
+
+
+# ============================================================
+# ACTIVITY PAGE
+#
+# Shows:
+#   1. Activity history
+#   2. Form submissions
+#   3. Delete Activity button
 # ============================================================
 
 @APP.get(
     "/api/activity/<tracking_id>"
 )
 def get_activity(tracking_id):
+
+    if not tracking_exists(
+        tracking_id
+    ):
+
+        return render_template_string(
+            MESSAGE_HTML,
+            title="Invalid Tracking ID",
+            message=(
+                "This tracking ID is invalid."
+            ),
+            back=True
+        ), 404
+
+    conn = get_db()
+
+    # --------------------------------------------------------
+    # Activity
+    # --------------------------------------------------------
+
+    activity_rows = conn.execute("""
+        SELECT
+            id,
+            event,
+            timestamp,
+            ip,
+            user_agent,
+            referer
+        FROM activity
+        WHERE tracking_id = ?
+        ORDER BY id ASC
+    """, (
+        tracking_id,
+    )).fetchall()
+
+    # --------------------------------------------------------
+    # Form submissions
+    # --------------------------------------------------------
+
+    submission_rows = conn.execute("""
+        SELECT
+            id,
+            name,
+            phone,
+            email,
+            submitted_at,
+            ip,
+            user_agent,
+            referer
+        FROM form_submissions
+        WHERE tracking_id = ?
+        ORDER BY id DESC
+    """, (
+        tracking_id,
+    )).fetchall()
+
+    # --------------------------------------------------------
+    # Email details
+    # --------------------------------------------------------
+
+    email_row = conn.execute("""
+        SELECT
+            recipient,
+            subject,
+            sent_at
+        FROM emails
+        WHERE tracking_id = ?
+    """, (
+        tracking_id,
+    )).fetchone()
+
+    conn.close()
+
+    return render_template_string(
+        ACTIVITY_HTML,
+        tracking_id=tracking_id,
+        email=email_row,
+        activity=activity_rows,
+        submissions=submission_rows,
+        format_time=display_time
+    )
+
+
+# ============================================================
+# DELETE ACTIVITY
+#
+# IMPORTANT:
+# This deletes only activity rows.
+#
+# It does NOT delete:
+#   - email record
+#   - tracking ID
+#   - form submissions
+# ============================================================
+
+@APP.post(
+    "/api/activity/<tracking_id>/delete"
+)
+def delete_activity(tracking_id):
+
+    if not tracking_exists(
+        tracking_id
+    ):
+
+        return render_template_string(
+            MESSAGE_HTML,
+            title="Invalid Tracking ID",
+            message=(
+                "This tracking ID is invalid."
+            ),
+            back=True
+        ), 404
+
+    conn = get_db()
+
+    conn.execute("""
+        DELETE FROM activity
+        WHERE tracking_id = ?
+    """, (
+        tracking_id,
+    ))
+
+    conn.commit()
+
+    conn.close()
+
+    return render_template_string(
+        MESSAGE_HTML,
+        title="Activity Deleted",
+        message=(
+            "Activity history for this email "
+            "has been deleted successfully. "
+            "The email record and form submissions "
+            "were not deleted."
+        ),
+        back=True
+    )
+
+
+# ============================================================
+# FORM SUBMISSIONS API
+#
+# Kept as an API too.
+# ============================================================
+
+@APP.get(
+    "/api/submissions/<tracking_id>"
+)
+def get_submissions(tracking_id):
 
     if not tracking_exists(
         tracking_id
@@ -1214,31 +1511,39 @@ def get_activity(tracking_id):
 
     rows = conn.execute("""
         SELECT
-
             id,
-            event,
-            timestamp,
+            tracking_id,
+            name,
+            phone,
+            email,
+            submitted_at,
             ip,
             user_agent,
-            referer,
-            name,
-            email
-
-        FROM activity
-
+            referer
+        FROM form_submissions
         WHERE tracking_id = ?
-
-        ORDER BY id ASC
+        ORDER BY id DESC
     """, (
         tracking_id,
     )).fetchall()
 
     conn.close()
 
-    return jsonify([
-        dict(row)
-        for row in rows
-    ])
+    output = []
+
+    for row in rows:
+
+        item = dict(row)
+
+        item["submitted_ist"] = display_time(
+            item["submitted_at"]
+        )
+
+        output.append(
+            item
+        )
+
+    return jsonify(output)
 
 
 # ============================================================
@@ -1260,37 +1565,69 @@ def get_emails():
 
     conn.close()
 
-    return jsonify([
-        dict(row)
-        for row in rows
-    ])
+    output = []
+
+    for row in rows:
+
+        item = dict(row)
+
+        item["sent_ist"] = display_time(
+            item["sent_at"]
+        )
+
+        # ----------------------------------------------------
+        # First Open / Last Open intentionally NOT returned.
+        # ----------------------------------------------------
+
+        item.pop(
+            "first_opened_at",
+            None
+        )
+
+        item.pop(
+            "last_opened_at",
+            None
+        )
+
+        item["first_click_ist"] = display_time(
+            item["first_clicked_at"]
+        )
+
+        item["last_click_ist"] = display_time(
+            item["last_clicked_at"]
+        )
+
+        item["first_page_visit_ist"] = display_time(
+            item["first_page_visit_at"]
+        )
+
+        item["last_page_visit_ist"] = display_time(
+            item["last_page_visit_at"]
+        )
+
+        output.append(
+            item
+        )
+
+    return jsonify(output)
 
 
 # ============================================================
-# HEALTH CHECK
+# HEALTH
 # ============================================================
 
-@APP.get(
-    "/health"
-)
+@APP.get("/health")
 def health():
 
+    now = utc_now()
+
     return jsonify({
-
-        "ok":
-            True,
-
-        "application":
-            "email-tracker",
-
-        "sender":
-            SENDER_EMAIL,
-
-        "public_url":
-            PUBLIC_URL,
-
-        "time_utc":
-            utc_now()
+        "ok": True,
+        "application": "email-tracker",
+        "sender": SENDER_EMAIL,
+        "public_url": PUBLIC_URL,
+        "time_utc": now,
+        "time_ist": display_time(now)
     })
 
 
@@ -1299,6 +1636,7 @@ def health():
 # ============================================================
 
 DASHBOARD_HTML = """
+
 <!doctype html>
 
 <html>
@@ -1317,238 +1655,212 @@ DASHBOARD_HTML = """
 <style>
 
 * {
-    box-sizing: border-box;
+    box-sizing:border-box;
 }
 
 body {
 
-    margin: 0;
+    margin:0;
 
-    padding: 25px;
+    padding:25px;
 
-    font-family:
-        Arial,
-        sans-serif;
+    font-family:Arial,sans-serif;
 
-    background:
-        #f4f6f9;
+    background:#f4f6f9;
 
-    color:
-        #222;
+    color:#222;
 }
 
 .container {
 
-    max-width:
-        1400px;
+    max-width:1600px;
 
-    margin:
-        auto;
+    margin:auto;
 }
 
 .card {
 
-    background:
-        white;
+    background:white;
 
-    border-radius:
-        14px;
+    border-radius:14px;
 
-    padding:
-        24px;
+    padding:24px;
 
-    margin-bottom:
-        20px;
+    margin-bottom:20px;
 
     box-shadow:
         0 3px 18px
         rgba(0,0,0,.07);
 }
 
-h1 {
-
-    margin-top: 0;
-}
-
+h1,
 h2 {
 
-    margin-top: 0;
+    margin-top:0;
 }
 
 label {
 
-    display:
-        block;
+    display:block;
 
-    font-weight:
-        600;
+    font-weight:600;
 
-    margin-top:
-        15px;
+    margin-top:15px;
 
-    margin-bottom:
-        6px;
+    margin-bottom:6px;
 }
 
 input,
 textarea {
 
-    width:
-        100%;
+    width:100%;
 
-    padding:
-        12px;
+    padding:12px;
 
     border:
         1px solid #ccc;
 
-    border-radius:
-        8px;
+    border-radius:8px;
 
-    font-size:
-        15px;
+    font-size:15px;
 
-    font-family:
-        inherit;
+    font-family:inherit;
 }
 
 textarea {
 
-    min-height:
-        140px;
+    min-height:140px;
 
-    resize:
-        vertical;
+    resize:vertical;
 }
 
 button {
 
-    margin-top:
-        18px;
+    margin-top:18px;
 
-    padding:
-        12px 22px;
+    padding:12px 22px;
 
-    background:
-        #222;
+    background:#222;
 
-    color:
-        white;
+    color:white;
 
-    border:
-        0;
+    border:0;
 
-    border-radius:
-        8px;
+    border-radius:8px;
 
-    cursor:
-        pointer;
+    cursor:pointer;
 
-    font-size:
-        15px;
+    font-size:15px;
 }
 
 .public-url {
 
-    background:
-        #f0f2f5;
+    background:#f0f2f5;
 
-    padding:
-        10px;
+    padding:10px;
 
-    border-radius:
-        7px;
+    border-radius:7px;
 
-    word-break:
-        break-all;
+    word-break:break-all;
 
-    font-family:
-        monospace;
+    font-family:monospace;
 }
 
 .table-wrap {
 
-    overflow-x:
-        auto;
+    overflow-x:auto;
 }
 
 table {
 
-    width:
-        100%;
+    width:100%;
 
-    border-collapse:
-        collapse;
+    border-collapse:collapse;
 
-    min-width:
-        1200px;
+    min-width:1700px;
 }
 
 th,
 td {
 
-    padding:
-        11px;
+    padding:11px;
 
     border-bottom:
         1px solid #ddd;
 
-    text-align:
-        left;
+    text-align:left;
 
-    vertical-align:
-        top;
+    vertical-align:top;
 }
 
 th {
 
-    background:
-        #f0f0f0;
+    background:#f0f0f0;
 }
 
 .badge {
 
-    display:
-        inline-block;
+    display:inline-block;
 
-    padding:
-        4px 8px;
+    padding:5px 9px;
 
-    border-radius:
-        6px;
+    border-radius:6px;
 
-    background:
-        #eee;
+    background:#eee;
 
-    font-weight:
-        600;
+    font-weight:600;
 }
 
 .small {
 
-    font-size:
-        12px;
+    font-size:12px;
 
-    color:
-        #666;
+    color:#666;
 
-    line-height:
-        1.5;
+    line-height:1.5;
+}
+
+.time {
+
+    white-space:nowrap;
+
+    font-size:13px;
 }
 
 a {
 
-    color:
-        #1261a0;
+    color:#1261a0;
 
-    text-decoration:
-        none;
+    text-decoration:none;
 }
 
 a:hover {
 
-    text-decoration:
-        underline;
+    text-decoration:underline;
+}
+
+.action {
+
+    display:inline-block;
+
+    padding:7px 10px;
+
+    margin:3px;
+
+    background:#222;
+
+    color:white;
+
+    border-radius:6px;
+
+    font-size:12px;
+}
+
+.action:hover {
+
+    color:white;
+
+    text-decoration:none;
 }
 
 </style>
@@ -1560,9 +1872,9 @@ a:hover {
 <div class="container">
 
 
-<!-- ===================================================== -->
-<!-- HEADER -->
-<!-- ===================================================== -->
+<!-- ======================================================
+     HEADER
+====================================================== -->
 
 <div class="card">
 
@@ -1571,31 +1883,51 @@ Email Tracker
 </h1>
 
 <p>
-<strong>From:</strong>
+
+<strong>
+From:
+</strong>
+
 {{ sender }}
+
 </p>
 
 <p>
-<strong>Cloudflare Public URL:</strong>
+
+<strong>
+Public URL:
+</strong>
+
 </p>
 
 <div class="public-url">
+
 {{ public_url }}
+
 </div>
 
 <p class="small">
-Open tracking records a request for the email's
-tracking image. Mail providers may automatically
-request/cache images, so an open event is not
-guaranteed proof that a person viewed the email.
+
+Open tracking is based on the tracking-image
+request. Email providers may preload images,
+so an open event is not guaranteed proof of
+manual reading.
+
+Click tracking is generated when the unique
+tracking URL is requested.
+
+The information form is shown openly on the
+landing page and requires the visitor to
+actively submit it with consent.
+
 </p>
 
 </div>
 
 
-<!-- ===================================================== -->
-<!-- SEND EMAIL -->
-<!-- ===================================================== -->
+<!-- ======================================================
+     SEND EMAIL
+====================================================== -->
 
 <div class="card">
 
@@ -1614,15 +1946,16 @@ Recipients
 
 <textarea
     name="recipients"
-    placeholder="one@example.com
-two@example.com
-three@example.com"
+    placeholder="user1@example.com
+user2@example.com
+user3@example.com"
     required
 ></textarea>
 
 <p class="small">
-You can enter one email per line, or separate
-emails with commas.
+
+One recipient per line, or use commas.
+
 </p>
 
 
@@ -1631,9 +1964,9 @@ Subject
 </label>
 
 <input
-    type="text"
     name="subject"
-    placeholder="Email subject"
+    type="text"
+    placeholder="Subject"
     required
 >
 
@@ -1644,7 +1977,7 @@ Message
 
 <textarea
     name="message"
-    placeholder="Write your email message here..."
+    placeholder="Write your email..."
     required
 ></textarea>
 
@@ -1652,7 +1985,9 @@ Message
 <button
     type="submit"
 >
+
 Send Email
+
 </button>
 
 </form>
@@ -1660,9 +1995,9 @@ Send Email
 </div>
 
 
-<!-- ===================================================== -->
-<!-- TRACKING TABLE -->
-<!-- ===================================================== -->
+<!-- ======================================================
+     TRACKING
+====================================================== -->
 
 <div class="card">
 
@@ -1691,15 +2026,7 @@ Sent
 </th>
 
 <th>
-Opened
-</th>
-
-<th>
-First Open
-</th>
-
-<th>
-Last Open
+Opens
 </th>
 
 <th>
@@ -1719,7 +2046,7 @@ Page Visits
 </th>
 
 <th>
-Activity
+Actions
 </th>
 
 </tr>
@@ -1740,46 +2067,50 @@ Activity
 {{ e["subject"] or "-" }}
 </td>
 
-<td>
-{{ e["sent_at"] or "-" }}
+<td class="time">
+
+{{ format_time(e["sent_at"]) }}
+
 </td>
 
 <td>
 
 <span class="badge">
+
 {{ e["open_count"] or 0 }}
+
 </span>
 
 </td>
 
 <td>
-{{ e["first_opened_at"] or "-" }}
-</td>
-
-<td>
-{{ e["last_opened_at"] or "-" }}
-</td>
-
-<td>
 
 <span class="badge">
+
 {{ e["click_count"] or 0 }}
+
 </span>
 
 </td>
 
-<td>
-{{ e["first_clicked_at"] or "-" }}
+<td class="time">
+
+{{ format_time(e["first_clicked_at"]) }}
+
 </td>
 
-<td>
-{{ e["last_clicked_at"] or "-" }}
+<td class="time">
+
+{{ format_time(e["last_clicked_at"]) }}
+
 </td>
 
 <td>
 
 <span class="badge">
+
 {{ e["page_visit_count"] or 0 }}
+
 </span>
 
 </td>
@@ -1787,19 +2118,19 @@ Activity
 <td>
 
 <a
+    class="action"
     href="/api/activity/{{ e["tracking_id"] }}"
     target="_blank"
 >
-Activity
+View Activity
 </a>
 
-<br>
-
 <a
+    class="action"
     href="/go/{{ e["tracking_id"] }}"
     target="_blank"
 >
-Test link
+Test Link
 </a>
 
 </td>
@@ -1810,8 +2141,12 @@ Test link
 
 <tr>
 
-<td colspan="11">
+<td
+    colspan="9"
+>
+
 No emails sent yet.
+
 </td>
 
 </tr>
@@ -1826,19 +2161,22 @@ No emails sent yet.
 
 </div>
 
+
 </div>
 
 </body>
 
 </html>
+
 """
 
 
 # ============================================================
-# SEND RESULT HTML
+# ACTIVITY HTML
 # ============================================================
 
-SEND_RESULT_HTML = """
+ACTIVITY_HTML = """
+
 <!doctype html>
 
 <html>
@@ -1852,39 +2190,696 @@ SEND_RESULT_HTML = """
     content="width=device-width,initial-scale=1"
 >
 
+<title>Activity</title>
+
+<style>
+
+* {
+    box-sizing:border-box;
+}
+
+body {
+
+    margin:0;
+
+    padding:25px;
+
+    background:#f4f6f9;
+
+    color:#222;
+
+    font-family:Arial,sans-serif;
+}
+
+.container {
+
+    max-width:1600px;
+
+    margin:auto;
+}
+
+.card {
+
+    background:white;
+
+    padding:25px;
+
+    margin-bottom:20px;
+
+    border-radius:14px;
+
+    box-shadow:
+        0 4px 20px
+        rgba(0,0,0,.07);
+}
+
+.header {
+
+    display:flex;
+
+    justify-content:space-between;
+
+    align-items:center;
+
+    gap:15px;
+
+    flex-wrap:wrap;
+}
+
+h1,
+h2 {
+
+    margin-top:0;
+}
+
+.info {
+
+    background:#f0f2f5;
+
+    padding:15px;
+
+    border-radius:9px;
+
+    margin-top:15px;
+
+    line-height:1.7;
+}
+
+.table-wrap {
+
+    overflow-x:auto;
+}
+
+table {
+
+    width:100%;
+
+    border-collapse:collapse;
+
+    min-width:1000px;
+}
+
+th,
+td {
+
+    padding:12px;
+
+    border-bottom:
+        1px solid #ddd;
+
+    text-align:left;
+
+    vertical-align:top;
+}
+
+th {
+
+    background:#f0f0f0;
+
+    font-weight:700;
+}
+
+tr:hover {
+
+    background:#fafafa;
+}
+
+.event {
+
+    display:inline-block;
+
+    padding:5px 10px;
+
+    border-radius:7px;
+
+    background:#eee;
+
+    font-weight:600;
+
+    text-transform:uppercase;
+
+    font-size:12px;
+}
+
+.event-open {
+
+    background:#e8f5e9;
+}
+
+.event-click {
+
+    background:#e3f2fd;
+}
+
+.event-page {
+
+    background:#fff3e0;
+}
+
+.event-form {
+
+    background:#f3e5f5;
+}
+
+.small {
+
+    font-size:12px;
+
+    color:#666;
+
+    word-break:break-word;
+
+    line-height:1.5;
+}
+
+.time {
+
+    white-space:nowrap;
+
+    font-size:13px;
+}
+
+.button-row {
+
+    display:flex;
+
+    gap:10px;
+
+    flex-wrap:wrap;
+
+    margin-top:20px;
+}
+
+button,
+.action {
+
+    display:inline-block;
+
+    padding:10px 15px;
+
+    border:0;
+
+    border-radius:8px;
+
+    background:#222;
+
+    color:white;
+
+    cursor:pointer;
+
+    text-decoration:none;
+
+    font-size:14px;
+}
+
+.delete {
+
+    background:#b42318;
+}
+
+.back {
+
+    background:#555;
+}
+
+button:hover,
+.action:hover {
+
+    opacity:.85;
+
+    color:white;
+
+    text-decoration:none;
+}
+
+.empty {
+
+    padding:25px;
+
+    text-align:center;
+
+    color:#777;
+}
+
+.warning {
+
+    background:#fff4e5;
+
+    border:1px solid #ffd8a8;
+
+    padding:13px;
+
+    border-radius:8px;
+
+    margin-top:15px;
+
+    font-size:13px;
+
+    line-height:1.5;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+
+<!-- ======================================================
+     ACTIVITY HEADER
+====================================================== -->
+
+<div class="card">
+
+<div class="header">
+
+<div>
+
+<h1>
+Activity
+</h1>
+
+<p class="small">
+
+Tracking ID:
+
+{{ tracking_id }}
+
+</p>
+
+</div>
+
+<div>
+
+<a
+    class="action back"
+    href="/"
+>
+← Dashboard
+</a>
+
+</div>
+
+</div>
+
+
+{% if email %}
+
+<div class="info">
+
+<strong>
+Recipient:
+</strong>
+
+{{ email["recipient"] }}
+
+<br>
+
+<strong>
+Subject:
+</strong>
+
+{{ email["subject"] or "-" }}
+
+<br>
+
+<strong>
+Sent:
+</strong>
+
+{{ format_time(email["sent_at"]) }}
+
+</div>
+
+{% endif %}
+
+
+<div class="warning">
+
+Activity history can be deleted below.
+
+Deleting activity does not delete the
+email tracking record or submitted
+form data.
+
+</div>
+
+
+<div class="button-row">
+
+<form
+    method="POST"
+    action="/api/activity/{{ tracking_id }}/delete"
+    onsubmit="return confirm(
+        'Delete all activity history for this email?'
+    );"
+>
+
+<button
+    type="submit"
+    class="delete"
+>
+
+Delete Activity
+
+</button>
+
+</form>
+
+</div>
+
+</div>
+
+
+<!-- ======================================================
+     ACTIVITY HISTORY TABLE
+====================================================== -->
+
+<div class="card">
+
+<h2>
+Activity History
+</h2>
+
+<div class="table-wrap">
+
+<table>
+
+<thead>
+
+<tr>
+
+<th>
+#
+</th>
+
+<th>
+Event
+</th>
+
+<th>
+Time
+</th>
+
+<th>
+IP
+</th>
+
+<th>
+User Agent
+</th>
+
+<th>
+Referer
+</th>
+
+</tr>
+
+</thead>
+
+<tbody>
+
+{% for row in activity %}
+
+<tr>
+
+<td>
+{{ row["id"] }}
+</td>
+
+<td>
+
+{% if row["event"] == "open" %}
+
+<span class="event event-open">
+OPEN
+</span>
+
+{% elif row["event"] == "click" %}
+
+<span class="event event-click">
+CLICK
+</span>
+
+{% elif row["event"] == "page_visit" %}
+
+<span class="event event-page">
+PAGE VISIT
+</span>
+
+{% elif row["event"] == "form_submit" %}
+
+<span class="event event-form">
+FORM SUBMIT
+</span>
+
+{% else %}
+
+<span class="event">
+{{ row["event"] }}
+</span>
+
+{% endif %}
+
+</td>
+
+<td class="time">
+
+{{ format_time(row["timestamp"]) }}
+
+</td>
+
+<td class="small">
+
+{{ row["ip"] or "-" }}
+
+</td>
+
+<td class="small">
+
+{{ row["user_agent"] or "-" }}
+
+</td>
+
+<td class="small">
+
+{{ row["referer"] or "-" }}
+
+</td>
+
+</tr>
+
+{% else %}
+
+<tr>
+
+<td
+    colspan="6"
+    class="empty"
+>
+
+No activity found.
+
+</td>
+
+</tr>
+
+{% endfor %}
+
+</tbody>
+
+</table>
+
+</div>
+
+</div>
+
+
+<!-- ======================================================
+     FORM SUBMISSIONS TABLE
+====================================================== -->
+
+<div class="card">
+
+<h2>
+Form Submissions
+</h2>
+
+<p class="small">
+
+This table contains only the information that
+the visitor explicitly entered and submitted
+through the disclosed form.
+
+</p>
+
+<div class="table-wrap">
+
+<table>
+
+<thead>
+
+<tr>
+
+<th>
+#
+</th>
+
+<th>
+Name
+</th>
+
+<th>
+Phone
+</th>
+
+<th>
+Email
+</th>
+
+<th>
+Submitted
+</th>
+
+<th>
+IP
+</th>
+
+<th>
+User Agent
+</th>
+
+<th>
+Referer
+</th>
+
+</tr>
+
+</thead>
+
+<tbody>
+
+{% for row in submissions %}
+
+<tr>
+
+<td>
+{{ row["id"] }}
+</td>
+
+<td>
+{{ row["name"] }}
+</td>
+
+<td>
+{{ row["phone"] }}
+</td>
+
+<td>
+{{ row["email"] }}
+</td>
+
+<td class="time">
+
+{{ format_time(row["submitted_at"]) }}
+
+</td>
+
+<td class="small">
+
+{{ row["ip"] or "-" }}
+
+</td>
+
+<td class="small">
+
+{{ row["user_agent"] or "-" }}
+
+</td>
+
+<td class="small">
+
+{{ row["referer"] or "-" }}
+
+</td>
+
+</tr>
+
+{% else %}
+
+<tr>
+
+<td
+    colspan="8"
+    class="empty"
+>
+
+No form has been submitted yet.
+
+</td>
+
+</tr>
+
+{% endfor %}
+
+</tbody>
+
+</table>
+
+</div>
+
+</div>
+
+
+</div>
+
+</body>
+
+</html>
+
+"""
+
+
+# ============================================================
+# SEND RESULT HTML
+# ============================================================
+
+SEND_RESULT_HTML = """
+
+<!doctype html>
+
+<html>
+
+<head>
+
+<meta charset="utf-8">
+
 <title>Send Result</title>
 
 <style>
 
 body {
 
-    font-family:
-        Arial,
-        sans-serif;
+    font-family:Arial,sans-serif;
 
-    background:
-        #f4f6f9;
+    background:#f4f6f9;
 
-    padding:
-        30px;
+    padding:30px;
 }
 
 .card {
 
-    max-width:
-        900px;
+    max-width:950px;
 
-    margin:
-        auto;
+    margin:auto;
 
-    background:
-        white;
+    background:white;
 
-    padding:
-        25px;
+    padding:25px;
 
-    border-radius:
-        12px;
+    border-radius:12px;
 
     box-shadow:
         0 4px 20px
@@ -1893,17 +2888,13 @@ body {
 
 .result {
 
-    padding:
-        15px;
+    padding:15px;
 
-    margin:
-        10px 0;
+    margin:10px 0;
 
-    border-radius:
-        8px;
+    border-radius:8px;
 
-    background:
-        #f3f3f3;
+    background:#f3f3f3;
 }
 
 .success {
@@ -1918,10 +2909,16 @@ body {
         5px solid #d64545;
 }
 
+.url {
+
+    word-break:break-all;
+
+    font-family:monospace;
+}
+
 a {
 
-    color:
-        #1261a0;
+    color:#1261a0;
 }
 
 </style>
@@ -1935,7 +2932,6 @@ a {
 <h2>
 Send Result
 </h2>
-
 
 {% for r in results %}
 
@@ -1955,16 +2951,20 @@ Sent:
 Tracking URL:
 </strong>
 
-<br>
+<div class="url">
 
 <a
     href="{{ r["tracking_url"] }}"
     target="_blank"
 >
+
 {{ r["tracking_url"] }}
+
 </a>
 
-<br><br>
+</div>
+
+<br>
 
 <strong>
 Tracking ID:
@@ -1984,7 +2984,7 @@ Failed:
 
 {{ r.get("recipient", "-") }}
 
-<br>
+<br><br>
 
 {{ r.get("error", "Unknown error") }}
 
@@ -2029,14 +3029,16 @@ Invalid addresses
 </body>
 
 </html>
+
 """
 
 
 # ============================================================
-# GENERIC MESSAGE PAGE
+# MESSAGE HTML
 # ============================================================
 
 MESSAGE_HTML = """
+
 <!doctype html>
 
 <html>
@@ -2051,39 +3053,29 @@ MESSAGE_HTML = """
 
 body {
 
-    font-family:
-        Arial,
-        sans-serif;
+    font-family:Arial,sans-serif;
 
-    background:
-        #f4f6f9;
+    background:#f4f6f9;
 
-    padding:
-        40px;
+    padding:40px;
 }
 
 .card {
 
-    max-width:
-        600px;
+    max-width:600px;
 
-    margin:
-        auto;
+    margin:auto;
 
-    background:
-        white;
+    background:white;
 
-    padding:
-        30px;
+    padding:30px;
 
-    border-radius:
-        12px;
+    border-radius:12px;
 }
 
 a {
 
-    color:
-        #1261a0;
+    color:#1261a0;
 }
 
 </style>
@@ -2105,9 +3097,11 @@ a {
 {% if back %}
 
 <p>
+
 <a href="/">
 ← Back
 </a>
+
 </p>
 
 {% endif %}
@@ -2117,14 +3111,16 @@ a {
 </body>
 
 </html>
+
 """
 
 
 # ============================================================
-# LANDING PAGE
+# LANDING PAGE WITH DISCLOSED FORM
 # ============================================================
 
 LANDING_HTML = """
+
 <!doctype html>
 
 <html>
@@ -2143,114 +3139,128 @@ LANDING_HTML = """
 <style>
 
 * {
-    box-sizing: border-box;
+    box-sizing:border-box;
 }
 
 body {
 
-    margin:
-        0;
+    margin:0;
 
-    padding:
-        30px;
+    padding:30px;
 
-    background:
-        #f5f7fb;
+    background:#f5f7fb;
 
-    font-family:
-        Arial,
-        sans-serif;
+    font-family:Arial,sans-serif;
+
+    color:#222;
 }
 
 .card {
 
-    max-width:
-        460px;
+    max-width:520px;
 
-    margin:
-        60px auto;
+    margin:50px auto;
 
-    padding:
-        30px;
+    padding:30px;
 
-    background:
-        white;
+    background:white;
 
-    border-radius:
-        14px;
+    border-radius:14px;
 
     box-shadow:
         0 5px 25px
         rgba(0,0,0,.08);
 }
 
-input {
+h2 {
 
-    width:
-        100%;
-
-    padding:
-        12px;
-
-    margin:
-        7px 0 15px;
-
-    border:
-        1px solid #ccc;
-
-    border-radius:
-        7px;
+    margin-top:0;
 }
 
 label {
 
-    display:
-        block;
+    display:block;
 
-    font-weight:
-        600;
+    margin-top:16px;
+
+    margin-bottom:6px;
+
+    font-weight:600;
+}
+
+input {
+
+    width:100%;
+
+    padding:12px;
+
+    border:1px solid #ccc;
+
+    border-radius:8px;
+
+    font-size:15px;
+}
+
+.consent {
+
+    display:flex;
+
+    gap:10px;
+
+    align-items:flex-start;
+
+    margin-top:18px;
+
+    font-size:13px;
+
+    line-height:1.5;
+
+    color:#555;
+}
+
+.consent input {
+
+    width:auto;
+
+    margin-top:3px;
 }
 
 button {
 
-    width:
-        100%;
+    width:100%;
 
-    padding:
-        12px;
+    margin-top:20px;
 
-    background:
-        #222;
+    padding:13px;
 
-    color:
-        white;
+    background:#222;
 
-    border:
-        0;
+    color:white;
 
-    border-radius:
-        7px;
+    border:0;
 
-    cursor:
-        pointer;
+    border-radius:8px;
+
+    cursor:pointer;
+
+    font-size:15px;
 }
 
-.small {
+.notice {
 
-    font-size:
-        13px;
+    background:#f0f2f5;
 
-    color:
-        #666;
+    padding:12px;
 
-    line-height:
-        1.5;
-}
+    border-radius:8px;
 
-#status {
+    font-size:13px;
 
-    margin-top:
-        15px;
+    line-height:1.5;
+
+    color:#555;
+
+    margin-bottom:20px;
 }
 
 </style>
@@ -2265,54 +3275,91 @@ button {
 Continue
 </h2>
 
-<p>
-You can voluntarily submit your name and email
-for this page.
-</p>
+<div class="notice">
 
-<form id="form">
+To continue, please provide the information
+below. By checking the consent box and
+submitting the form, you agree that the
+information you enter will be recorded for
+the stated purpose.
+
+</div>
+
+
+<form
+    method="POST"
+    action="/api/form-submit/{{ tracking_id }}"
+>
+
 
 <label>
 Name
 </label>
 
 <input
-    id="name"
+    type="text"
+    name="name"
+    maxlength="100"
     autocomplete="name"
     required
 >
 
 
 <label>
-Email
+Contact number
 </label>
 
 <input
-    id="email"
+    type="tel"
+    name="phone"
+    maxlength="20"
+    autocomplete="tel"
+    required
+>
+
+
+<label>
+Email address
+</label>
+
+<input
     type="email"
+    name="email"
+    maxlength="254"
     autocomplete="email"
     required
 >
 
 
-<p class="small">
-Only information that you voluntarily enter
-in this form is submitted.
-</p>
+<label class="consent">
+
+<input
+    type="checkbox"
+    name="consent"
+    value="yes"
+    required
+>
+
+<span>
+
+I understand that the name, contact number,
+and email address I enter in this form will be
+recorded along with the submission time.
+
+</span>
+
+</label>
 
 
 <button
-    id="submitButton"
     type="submit"
 >
-Continue
+
+Submit & Continue
+
 </button>
 
 </form>
-
-
-<div id="status">
-</div>
 
 </div>
 
@@ -2322,139 +3369,19 @@ Continue
 const trackingId =
     "{{ tracking_id }}";
 
-const form =
-    document.getElementById(
-        "form"
-    );
 
-const button =
-    document.getElementById(
-        "submitButton"
-    );
-
-const status =
-    document.getElementById(
-        "status"
-    );
-
-
-// ==========================================================
+// ----------------------------------------------------------
 // PAGE VISIT
-// ==========================================================
+// ----------------------------------------------------------
 
 fetch(
-    "/api/activity/" + trackingId,
+    "/api/page-visit/" + trackingId,
     {
-
-        method:
-            "POST",
-
-        headers: {
-            "Content-Type":
-                "application/json"
-        },
-
-        body: JSON.stringify({
-            event:
-                "page_visit"
-        })
+        method:"POST"
     }
-).catch(
+)
+.catch(
     () => {}
-);
-
-
-// ==========================================================
-// FORM SUBMIT
-// ==========================================================
-
-form.addEventListener(
-    "submit",
-    async function(event) {
-
-        event.preventDefault();
-
-        button.disabled = true;
-
-        status.textContent =
-            "Submitting...";
-
-        const name =
-            document
-            .getElementById(
-                "name"
-            )
-            .value
-            .trim();
-
-        const email =
-            document
-            .getElementById(
-                "email"
-            )
-            .value
-            .trim();
-
-        try {
-
-            const response =
-                await fetch(
-                    "/api/activity/" +
-                    trackingId,
-                    {
-
-                        method:
-                            "POST",
-
-                        headers: {
-                            "Content-Type":
-                                "application/json"
-                        },
-
-                        body:
-                            JSON.stringify({
-
-                                event:
-                                    "form_submit",
-
-                                name:
-                                    name,
-
-                                email:
-                                    email
-                            })
-                    }
-                );
-
-            const data =
-                await response.json();
-
-            if (response.ok) {
-
-                status.textContent =
-                    "Submitted successfully.";
-
-                form.reset();
-
-            } else {
-
-                status.textContent =
-                    data.error ||
-                    "Submission failed.";
-
-            }
-
-        } catch (error) {
-
-            status.textContent =
-                "Network error.";
-
-        } finally {
-
-            button.disabled = false;
-        }
-
-    }
 );
 
 </script>
@@ -2462,52 +3389,265 @@ form.addEventListener(
 </body>
 
 </html>
+
 """
 
 
 # ============================================================
-# START SERVER
+# FORM ERROR HTML
+# ============================================================
+
+FORM_ERROR_HTML = """
+
+<!doctype html>
+
+<html>
+
+<head>
+
+<meta charset="utf-8">
+
+<meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+>
+
+<title>Form Error</title>
+
+<style>
+
+body {
+
+    margin:0;
+
+    padding:30px;
+
+    background:#f5f7fb;
+
+    font-family:Arial,sans-serif;
+}
+
+.card {
+
+    max-width:500px;
+
+    margin:70px auto;
+
+    background:white;
+
+    padding:30px;
+
+    border-radius:14px;
+
+    box-shadow:
+        0 5px 25px
+        rgba(0,0,0,.08);
+
+    text-align:center;
+}
+
+a {
+
+    color:#1261a0;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="card">
+
+<h2>
+Form Error
+</h2>
+
+<p>
+{{ message }}
+</p>
+
+<p>
+
+<a href="/go/{{ tracking_id }}">
+← Go back to form
+</a>
+
+</p>
+
+</div>
+
+</body>
+
+</html>
+
+"""
+
+
+# ============================================================
+# FORM SUCCESS HTML
+# ============================================================
+
+FORM_SUCCESS_HTML = """
+
+<!doctype html>
+
+<html>
+
+<head>
+
+<meta charset="utf-8">
+
+<meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+>
+
+<title>Submitted</title>
+
+<style>
+
+body {
+
+    margin:0;
+
+    padding:30px;
+
+    background:#f5f7fb;
+
+    font-family:Arial,sans-serif;
+}
+
+.card {
+
+    max-width:500px;
+
+    margin:70px auto;
+
+    background:white;
+
+    padding:30px;
+
+    border-radius:14px;
+
+    box-shadow:
+        0 5px 25px
+        rgba(0,0,0,.08);
+
+    text-align:center;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="card">
+
+<h2>
+Thank you
+</h2>
+
+<p>
+Your information has been submitted.
+</p>
+
+<p>
+You may now continue.
+</p>
+
+</div>
+
+</body>
+
+</html>
+
+"""
+
+
+# ============================================================
+# START APPLICATION
 # ============================================================
 
 if __name__ == "__main__":
 
     print()
+
     print("=" * 70)
-    print("EMAIL TRACKER")
+
+    print(
+        "EMAIL TRACKER"
+    )
+
     print("=" * 70)
 
     print()
-    print("Sender:")
-    print(SENDER_EMAIL)
+
+    print(
+        "Sender:"
+    )
+
+    print(
+        SENDER_EMAIL
+    )
 
     print()
-    print("Public URL:")
-    print(PUBLIC_URL)
+
+    print(
+        "Public URL:"
+    )
+
+    print(
+        PUBLIC_URL
+    )
 
     print()
-    print("Dashboard:")
+
+    print(
+        "Dashboard:"
+    )
+
     print(
         f"http://127.0.0.1:{PORT}/"
     )
 
     print()
-    print("Health:")
+
+    print(
+        "Health:"
+    )
+
     print(
         f"http://127.0.0.1:{PORT}/health"
     )
 
     print()
-    print("Database:")
-    print(DB_FILE)
+
+    print(
+        "Database:"
+    )
+
+    print(
+        DB_FILE
+    )
 
     print()
-    print("Gmail token:")
-    print(TOKEN_FILE)
+
+    print(
+        "Gmail token:"
+    )
+
+    print(
+        "GMAIL_TOKEN_JSON environment variable"
+        if os.environ.get("GMAIL_TOKEN_JSON")
+        else TOKEN_FILE
+    )
 
     print()
+
     print("=" * 70)
 
-    # Create fresh DB if it doesn't exist
     init_db()
 
     APP.run(
